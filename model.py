@@ -29,3 +29,15 @@ class CausalSelfAttention(nn.Module):
         x = x.transpose(1, 2).contiguous().view(batch, token, dim)
 
         return self.o_proj(x)
+
+class MLP(nn.Module):
+    def __init__(self, embedding_dim, mlp_ratio):
+        super().__init__()
+
+        # no bias to save bandwidth and because it has been shown to reduce training stability
+        self.expand = nn.Linear(embedding_dim, embedding_dim*mlp_ratio, bias=False)
+        self.compress = nn.Linear(embedding_dim*mlp_ratio, embedding_dim, bias=False)
+
+    def forward(self, x):
+        x = F.gelu(self.expand(x))
+        return self.compress(x)
