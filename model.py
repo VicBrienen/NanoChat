@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from helper import RMSNorm
+from helper import RMSNorm, precompute_freqs, apply_rope
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, embedding_dim, num_heads):
@@ -15,14 +15,21 @@ class CausalSelfAttention(nn.Module):
         self.qkv_proj = nn.Linear(embedding_dim, 3*embedding_dim, bias=False) # saves 2 reads of x
         self.o_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, freqs):
         batch, token, dim = x.size()
 
         # decompose qkv projection
         qkv = self.qkv_proj(x)
         qkv = qkv.view(batch, token, 3, self.num_heads, self.head_dim) # (batch, token, 3, num_heads, head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4) # (3, batch, num_heads, token, head_dim)
-        q, k, v = qkv.unbind(0)
+        q, k, v = qkv.unbind(2)
+
+        q = apply_rope(q, freqs)
+        k = apply_rope(k, freqs)
+
+        # (batch, num_heads, token, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         x = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
@@ -53,12 +60,12 @@ class Block(nn.Module):
         self.norm_2 = RMSNorm(embedding_dim)
         self.mlp = MLP(embedding_dim, mlp_ratio)
 
-    def forward(self, x):
-        x = x + self.attention(self.norm_1(x))
+    def forward(self, x, freqs):
+        x = x + self.attention(self.norm_1(x), freqs)
         return x + self.mlp(self.norm_2(x))
     
 class Transformer(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, num_heads, mlp_ratio, num_layers):
+    def __init__(self, vocab_size, embedding_dim, num_heads, mlp_ratio, num_layers, max_seq_length):
         super().__init__()
 
         self.token_embedding = nn.Embedding(vocab_size, embedding_dim) # optimized version of nn.Linear assuming one hot input
@@ -71,10 +78,15 @@ class Transformer(nn.Module):
         self.output_projection = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.output_projection.weight = self.token_embedding.weight
 
+        self.register_buffer("freqs", precompute_freqs(embedding_dim // num_heads, max_seq_length))
+
     def forward(self, index):
+        t = index.size(1)
         x = self.token_embedding(index)
 
+        freqs = self.freqs[:t] # slicing allows seq_len < max_seq_len
+
         for block in self.blocks:
-            x = block(x)
+            x = block(x, freqs)
 
         return self.output_projection(self.norm(x))
